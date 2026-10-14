@@ -1,0 +1,395 @@
+# The Atlas backend, on a machine GitHub takes away every six hours.
+#
+# GitHub kills a workflow run at six hours, hard. So this run starts its own
+# replacement before it dies, and the replacement does the same. An always-on
+# EC2 instance relays a fixed public port to whichever runner is currently
+# alive, so the address never changes and nothing downstream has to know that
+# the machine behind it is replaced four times a day.
+#
+# What makes this affordable: this repository is public, so Actions minutes are
+# unlimited. A perpetual runner burns about 720 hours a month, which on a
+# private repository would exhaust the 2,000-minute free allowance in 33 hours.
+# The application itself is private and is checked out with a token.
+#
+# What makes it survivable: nothing important lives on the runner. The lake is
+# on R2 and Drive, the password hash and token secret are repository secrets,
+# and the only local state is a 6.2 GiB cache of the two tiers that must be
+# local to be fast. A wipe costs four minutes of re-warming, not any data.
+#
+# The re-dispatch at the end is conditional on the worker having stayed up more
+# than twenty minutes. Without that brake, a run that dies in its first minute
+# re-dispatches immediately and a broken state becomes a dispatch loop bounded
+# only by GitHub's abuse detection -- which is a real finding from this
+# account's own 2026-09-12 review of its other perpetual runner, not a
+# hypothetical.
+
+name: atlas
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Why this run was started
+        required: false
+        default: manual
+  repository_dispatch:
+    types: [atlas-restart]
+  # The safety net. If both the self-dispatch and the EC2 watchdog fail, cron
+  # brings the service back within the hour rather than leaving it down until
+  # someone notices.
+  schedule:
+    - cron: '17 */4 * * *'
+
+# One runner at a time, and never cancel the one that is serving traffic.
+# `cancel-in-progress: true` here would mean every cron tick killed a healthy
+# backend mid-request.
+concurrency:
+  group: atlas-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ATLAS_HOME: /opt/atlas
+  ATLAS_PORT: '8787'
+  # 5 h 40 m. GitHub kills at 6 h; the successor is dispatched at 5 h 30 m, so
+  # there is a ten-minute overlap in which the relay can move across before
+  # this one exits.
+  SERVE_SECONDS: '20400'
+  DISPATCH_AFTER_SECONDS: '19800'
+  # The brake. Below this, the run is assumed to have failed rather than served.
+  MIN_UPTIME_TO_REDISPATCH: '1200'
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      # ------------------------------------------------------------------ #
+      - name: Reclaim disk
+        # The runner ships with ~14 GB free on / and about 45 GB of
+        # preinstalled toolchains nobody here uses. The local tier is 6.2 GiB
+        # and the Drive VFS cache is 8 GiB, so 14 GB is not enough and the
+        # failure would be a disk-full error twenty minutes into warming.
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune -af || true
+          echo "after:"; df -h / | tail -1
+          free -g | head -2
+
+      - name: Check out the application
+        uses: actions/checkout@v4
+        with:
+          repository: prarthanadoshi7/atlas-search
+          token: ${{ secrets.ATLAS_REPO_PAT }}
+          path: app
+          # One commit. The history is 150 MB of screenshots and docs that the
+          # backend does not need.
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: app/backend/requirements.txt
+
+      - name: Install the backend
+        working-directory: app
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+          python -c "import duckdb; print('duckdb', duckdb.__version__)"
+
+      - name: Install rclone
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          rclone version | head -1
+
+      # ------------------------------------------------------------------ #
+      - name: Write the environment
+        # Mode 600 and outside the workspace, so nothing in the checkout can
+        # read it and no step can accidentally upload it as an artifact.
+        env:
+          R2_ACCOUNT: ${{ secrets.ATLAS_R2_ACCOUNT_ID }}
+          R2_KEY: ${{ secrets.ATLAS_R2_ACCESS_KEY_ID }}
+          R2_SECRET: ${{ secrets.ATLAS_R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.ATLAS_R2_BUCKET }}
+          GD_CLIENT_ID: ${{ secrets.ATLAS_GDRIVE_CLIENT_ID }}
+          GD_CLIENT_SECRET: ${{ secrets.ATLAS_GDRIVE_CLIENT_SECRET }}
+          GD_TOKEN: ${{ secrets.ATLAS_GDRIVE_REFRESH_TOKEN }}
+          GD_FOLDER: ${{ secrets.ATLAS_DRIVE_FOLDER_ID }}
+          PASSWORD_HASH: ${{ secrets.ATLAS_PASSWORD_HASH }}
+          TOKEN_SECRET: ${{ secrets.ATLAS_TOKEN_SECRET }}
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$ATLAS_HOME"/{lake,scratch,logs,vfs-cache}
+          sudo chown -R "$USER" "$ATLAS_HOME"
+
+          missing=()
+          for v in R2_ACCOUNT R2_KEY R2_SECRET R2_BUCKET \
+                   GD_CLIENT_ID GD_CLIENT_SECRET GD_TOKEN \
+                   PASSWORD_HASH TOKEN_SECRET; do
+            [[ -n "${!v}" ]] || missing+=("$v")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::these repository secrets are not set: ${missing[*]}"
+            echo "See docs/DEPLOYMENT.md section 7." >&2
+            exit 1
+          fi
+
+          umask 077
+          cat > "$ATLAS_HOME/.env" <<EOF
+          ATLAS_AGG_ROOT=$ATLAS_HOME/lake/agg
+          ATLAS_DIMS_ROOT=$ATLAS_HOME/lake/dims
+          ATLAS_MANIFEST_ROOT=$ATLAS_HOME/lake/_manifest
+          ATLAS_PEOPLE_ROOT=r2://$R2_BUCKET/people
+          ATLAS_IDX_ROOT=r2://$R2_BUCKET/idx
+          ATLAS_CHILDREN_ROOT=/mnt/drive/$R2_BUCKET/children
+          ATLAS_SCRATCH=$ATLAS_HOME/scratch
+          ATLAS_DUCK_MEMORY=10GB
+          ATLAS_DUCK_THREADS=4
+          ATLAS_R2_ACCOUNT_ID=$R2_ACCOUNT
+          ATLAS_R2_ACCESS_KEY_ID=$R2_KEY
+          ATLAS_R2_SECRET_ACCESS_KEY=$R2_SECRET
+          ATLAS_R2_BUCKET=$R2_BUCKET
+          ATLAS_PASSWORD_HASH=$PASSWORD_HASH
+          ATLAS_TOKEN_SECRET=$TOKEN_SECRET
+          EOF
+          chmod 600 "$ATLAS_HOME/.env"
+
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [atlas-r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_KEY
+          secret_access_key = $R2_SECRET
+          endpoint = https://$R2_ACCOUNT.r2.cloudflarestorage.com
+          acl = private
+          no_check_bucket = true
+
+          [atlas-drive]
+          type = drive
+          scope = drive
+          client_id = $GD_CLIENT_ID
+          client_secret = $GD_CLIENT_SECRET
+          token = {"refresh_token":"$GD_TOKEN","token_type":"Bearer","expiry":"2000-01-01T00:00:00Z"}
+          root_folder_id = $GD_FOLDER
+          EOF
+          chmod 600 ~/.config/rclone/rclone.conf
+          echo "remotes: $(rclone listremotes | tr '\n' ' ')"
+
+      # ------------------------------------------------------------------ #
+      - name: Warm the local tier
+        # agg/ is 865 KB and answers every facet question; dims/ is 6.2 GiB and
+        # powers every typeahead keystroke. Both must be local: paying 100-300
+        # ms of network for a number that is already summed is the same mistake
+        # as scanning 107 million rows to count them, which is the whole reason
+        # this lake has an agg/ at all.
+        #
+        # ~6.2 GiB at the runner's bandwidth is two to four minutes, once per
+        # six-hour cycle.
+        run: |
+          set -euo pipefail
+          . "$ATLAS_HOME/.env"
+          t0=$SECONDS
+          for tier in agg _manifest dims; do
+            echo "::group::pulling $tier"
+            rclone copy "atlas-r2:$ATLAS_R2_BUCKET/$tier" \
+                        "$ATLAS_HOME/lake/$tier" \
+              --checksum --transfers 16 --checkers 32 \
+              --stats 30s --stats-one-line -v
+            echo "::endgroup::"
+          done
+          echo "local tier warmed in $((SECONDS - t0))s"
+          du -sh "$ATLAS_HOME/lake"/* | sed 's/^/  /'
+
+      - name: Mount the children tier
+        run: |
+          set -euo pipefail
+          . "$ATLAS_HOME/.env"
+          sudo mkdir -p "/mnt/drive/$ATLAS_R2_BUCKET"
+          sudo chown -R "$USER" /mnt/drive
+          # fuse needs this for --allow-other.
+          sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true
+          app/deploy/runner/mount-drive.sh "/mnt/drive/$ATLAS_R2_BUCKET"
+
+      # ------------------------------------------------------------------ #
+      - name: Start the backend
+        working-directory: app
+        run: |
+          set -euo pipefail
+          set -a; . "$ATLAS_HOME/.env"; set +a
+          export PYTHONPATH="$PWD:$PWD/database"
+          nohup python -m uvicorn backend.app.main:app \
+            --host 0.0.0.0 --port "$ATLAS_PORT" \
+            --workers 1 --timeout-keep-alive 75 \
+            > "$ATLAS_HOME/logs/uvicorn.log" 2>&1 &
+          echo $! > "$ATLAS_HOME/uvicorn.pid"
+
+          # Wait for a health response that proves the lake is actually
+          # readable, not merely that a port is open. A backend answering 200
+          # with an unreachable tier would pass a port check and fail every
+          # query.
+          for i in $(seq 1 90); do
+            body=$(curl -fsS "http://127.0.0.1:$ATLAS_PORT/api/health" 2>/dev/null || true)
+            if [[ -n "$body" ]] && [[ "$(jq -r '.ok' <<<"$body")" == "true" ]]; then
+              jq '{ok, detail, people_rows, auth, tiers}' <<<"$body"
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the backend did not become healthy in 90s"
+          tail -60 "$ATLAS_HOME/logs/uvicorn.log"
+          exit 1
+
+      - name: Confirm the gate is on
+        # A deployed instance that is quietly open looks exactly like one that
+        # is not. This is the cheapest possible check and it runs every cycle.
+        run: |
+          set -euo pipefail
+          h=$(curl -fsS "http://127.0.0.1:$ATLAS_PORT/api/health")
+          auth=$(jq -r '.auth' <<<"$h")
+          if [[ "$auth" != "true" ]]; then
+            echo "::error::the password gate is not configured -- refusing to serve"
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+                 "http://127.0.0.1:$ATLAS_PORT/api/geo")
+          if [[ "$code" != "401" ]]; then
+            echo "::error::/api/geo returned $code without a token, expected 401"
+            exit 1
+          fi
+          echo "gate on: /api/geo is 401 without a token"
+
+      # ------------------------------------------------------------------ #
+      - name: Join the mesh
+        env:
+          TS_AUTHKEY: ${{ secrets.ATLAS_TAILSCALE_AUTHKEY }}
+          HS_URL: ${{ secrets.ATLAS_HEADSCALE_URL }}
+          HS_CA: ${{ secrets.ATLAS_HEADSCALE_CA_CERT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TS_AUTHKEY:-}" || -z "${HS_URL:-}" ]]; then
+            echo "::warning::no mesh credentials; the backend is up but the "\
+                 "EC2 relay cannot reach it. Set ATLAS_TAILSCALE_AUTHKEY and "\
+                 "ATLAS_HEADSCALE_URL (docs/DEPLOYMENT.md section 9)."
+            exit 0
+          fi
+          curl -fsSL https://tailscale.com/install.sh | sudo bash
+          # The control server uses a self-signed CA on purpose: both ends are
+          # ours, and Let's Encrypt would need a domain. The runner has to be
+          # told to trust it.
+          if [[ -n "${HS_CA:-}" ]]; then
+            echo "$HS_CA" | sudo tee /usr/local/share/ca-certificates/headscale.crt >/dev/null
+            sudo update-ca-certificates
+          fi
+          sudo tailscaled --tun=userspace-networking \
+               --socks5-server=localhost:1055 \
+               --state=/var/lib/tailscale/tailscaled.state \
+               > "$ATLAS_HOME/logs/tailscaled.log" 2>&1 &
+          sleep 5
+          sudo tailscale up \
+            --login-server "$HS_URL" \
+            --authkey "$TS_AUTHKEY" \
+            --hostname atlas-runner \
+            --accept-dns=false \
+            --advertise-tags=tag:atlas || {
+              echo "::warning::could not join the mesh; serving locally only"
+              exit 0
+            }
+          ip=$(sudo tailscale ip -4 || true)
+          echo "mesh ip: ${ip:-unknown}"
+          echo "ATLAS_MESH_IP=${ip:-}" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------ #
+      - name: Serve
+        id: serve
+        run: |
+          set -uo pipefail
+          started=$SECONDS
+          dispatched=0
+          echo "serving for $SERVE_SECONDS seconds"
+
+          while (( SECONDS - started < SERVE_SECONDS )); do
+            up=$(( SECONDS - started ))
+
+            # The successor goes out ten minutes before this run exits, so the
+            # relay has somewhere to move to before this one stops answering.
+            if (( dispatched == 0 && up >= DISPATCH_AFTER_SECONDS )); then
+              echo "handing over at ${up}s"
+              curl -fsS -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer ${{ secrets.ATLAS_DISPATCH_PAT }}" \
+                "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+                -d '{"event_type":"atlas-restart","client_payload":{"reason":"handover"}}' \
+                && { dispatched=1; echo "successor dispatched"; } \
+                || echo "::warning::handover dispatch failed; cron will cover it"
+            fi
+
+            # A backend that has died must not keep the slot: exiting lets the
+            # EC2 watchdog start a replacement within five minutes instead of
+            # waiting out the remaining hours.
+            if ! curl -fsS --max-time 20 \
+                 "http://127.0.0.1:$ATLAS_PORT/api/health" >/dev/null; then
+              echo "::error::the backend stopped answering after ${up}s"
+              tail -40 "$ATLAS_HOME/logs/uvicorn.log"
+              echo "uptime=$up" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+
+            if (( up % 600 < 60 )); then
+              c=$(curl -fsS "http://127.0.0.1:$ATLAS_PORT/api/cache" \
+                  | jq -r '[.caches[] | "\(.name)=\(.size)"] | join(" ")' \
+                  2>/dev/null || echo "-")
+              printf 'up %5ds  disk %s  cache %s\n' \
+                "$up" "$(df -h / | awk 'NR==2{print $4}')" "$c"
+            fi
+            sleep 60
+          done
+          echo "uptime=$(( SECONDS - started ))" >> "$GITHUB_OUTPUT"
+          echo "served $(( (SECONDS - started) / 60 )) minutes"
+
+      # ------------------------------------------------------------------ #
+      - name: Launch the successor if this run actually served
+        if: always()
+        env:
+          UPTIME: ${{ steps.serve.outputs.uptime }}
+        run: |
+          set -uo pipefail
+          up=${UPTIME:-0}
+          if (( up < MIN_UPTIME_TO_REDISPATCH )); then
+            # The brake. A run that dies in its first minute must not
+            # re-dispatch, or a broken state becomes a tight dispatch loop
+            # bounded only by GitHub's abuse detection. Cron and the EC2
+            # watchdog will retry on a sane interval instead.
+            echo "::warning::served only ${up}s (< $MIN_UPTIME_TO_REDISPATCH);"\
+                 "not re-dispatching. Cron retries within the hour."
+            exit 0
+          fi
+          # The handover dispatch during `serve` is the normal path; this is the
+          # belt to its braces, for a run that exited without reaching it.
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.ATLAS_DISPATCH_PAT }}" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"atlas-restart","client_payload":{"reason":"exit"}}' \
+            || echo "::warning::re-dispatch failed; cron will cover it"
+
+      - name: Stop cleanly
+        if: always()
+        run: |
+          set +e
+          [[ -f "$ATLAS_HOME/uvicorn.pid" ]] && kill "$(cat "$ATLAS_HOME/uvicorn.pid")"
+          . "$ATLAS_HOME/.env" 2>/dev/null
+          app/deploy/runner/mount-drive.sh "/mnt/drive/${ATLAS_R2_BUCKET:-atlas-lake}" --unmount
+          sudo tailscale logout 2>/dev/null
+          tail -30 "$ATLAS_HOME/logs/uvicorn.log" 2>/dev/null
+          exit 0
