@@ -12,7 +12,7 @@
 # The application itself is private and is checked out with a token.
 #
 # What makes it survivable: nothing important lives on the runner. The lake is
-# on R2 and Drive, the password hash and token secret are repository secrets,
+# on Drive, the password hash and token secret are repository secrets,
 # and the only local state is a 6.2 GiB cache of the two tiers that must be
 # local to be fast. A wipe costs four minutes of re-warming, not any data.
 #
@@ -34,9 +34,19 @@ on:
         default: manual
   repository_dispatch:
     types: [atlas-restart]
-  # The safety net. If both the self-dispatch and the EC2 watchdog fail, cron
-  # brings the service back within the hour rather than leaving it down until
-  # someone notices.
+  # The primary trigger, and deliberately the only automatic one.
+  #
+  # Every four hours, while a run serves for 5 h 40 m, so successive runs
+  # overlap by 1 h 40 m and there is no gap to cover. An earlier design had
+  # each run dispatch its own successor, which needed a token with Actions
+  # write on this repository and -- as the 2026-09-12 review found as B7 --
+  # could become a dispatch loop bounded only by GitHub's abuse detection.
+  # A cron cannot loop, and needs no credential at all.
+  #
+  # The cost is that GitHub may delay a scheduled run under load. The overlap
+  # absorbs that; two consecutive misses would leave a gap, which the
+  # frontend's "backend starting" state covers and `workflow_dispatch`
+  # above fixes in one click.
   schedule:
     - cron: '17 */4 * * *'
 
@@ -52,14 +62,14 @@ permissions:
 
 env:
   ATLAS_HOME: /opt/atlas
+  # The rclone mount. people/ and children/ are read from here; the hot
+  # tiers are copied to $ATLAS_HOME/lake instead.
+  ATLAS_MOUNT: /mnt/atlas-drive
   ATLAS_PORT: '8787'
   # 5 h 40 m. GitHub kills at 6 h; the successor is dispatched at 5 h 30 m, so
   # there is a ten-minute overlap in which the relay can move across before
   # this one exits.
   SERVE_SECONDS: '20400'
-  DISPATCH_AFTER_SECONDS: '19800'
-  # The brake. Below this, the run is assumed to have failed rather than served.
-  MIN_UPTIME_TO_REDISPATCH: '1200'
 
 jobs:
   serve:
@@ -86,7 +96,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: prarthanadoshi7/atlas-search
-          token: ${{ secrets.ATLAS_REPO_PAT }}
+          # A read-only deploy key on atlas-search, not a PAT. One repository,
+          # read-only, and it can do nothing else -- where a fine-grained PAT is
+          # still an account credential, and has to be minted by hand in a
+          # browser. This one is created through the API.
+          ssh-key: ${{ secrets.ATLAS_REPO_DEPLOY_KEY }}
           path: app
           # One commit. The history is 150 MB of screenshots and docs that the
           # backend does not need.
@@ -116,25 +130,22 @@ jobs:
         # Mode 600 and outside the workspace, so nothing in the checkout can
         # read it and no step can accidentally upload it as an artifact.
         env:
-          R2_ACCOUNT: ${{ secrets.ATLAS_R2_ACCOUNT_ID }}
-          R2_KEY: ${{ secrets.ATLAS_R2_ACCESS_KEY_ID }}
-          R2_SECRET: ${{ secrets.ATLAS_R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.ATLAS_R2_BUCKET }}
           GD_CLIENT_ID: ${{ secrets.ATLAS_GDRIVE_CLIENT_ID }}
           GD_CLIENT_SECRET: ${{ secrets.ATLAS_GDRIVE_CLIENT_SECRET }}
           GD_TOKEN: ${{ secrets.ATLAS_GDRIVE_REFRESH_TOKEN }}
           GD_FOLDER: ${{ secrets.ATLAS_DRIVE_FOLDER_ID }}
           PASSWORD_HASH: ${{ secrets.ATLAS_PASSWORD_HASH }}
           TOKEN_SECRET: ${{ secrets.ATLAS_TOKEN_SECRET }}
+          ALLOWED_ORIGINS: ${{ secrets.ATLAS_ALLOWED_ORIGINS }}
         run: |
           set -euo pipefail
           sudo mkdir -p "$ATLAS_HOME"/{lake,scratch,logs,vfs-cache}
           sudo chown -R "$USER" "$ATLAS_HOME"
 
+          # Fail here, loudly, rather than three steps later with an rclone
+          # error that reads like a network problem.
           missing=()
-          for v in R2_ACCOUNT R2_KEY R2_SECRET R2_BUCKET \
-                   GD_CLIENT_ID GD_CLIENT_SECRET GD_TOKEN \
-                   PASSWORD_HASH TOKEN_SECRET; do
+          for v in GD_CLIENT_ID GD_CLIENT_SECRET GD_TOKEN GD_FOLDER                    PASSWORD_HASH TOKEN_SECRET; do
             [[ -n "${!v}" ]] || missing+=("$v")
           done
           if (( ${#missing[@]} )); then
@@ -147,33 +158,24 @@ jobs:
           cat > "$ATLAS_HOME/.env" <<EOF
           ATLAS_AGG_ROOT=$ATLAS_HOME/lake/agg
           ATLAS_DIMS_ROOT=$ATLAS_HOME/lake/dims
+          ATLAS_IDX_ROOT=$ATLAS_HOME/lake/idx
           ATLAS_MANIFEST_ROOT=$ATLAS_HOME/lake/_manifest
-          ATLAS_PEOPLE_ROOT=r2://$R2_BUCKET/people
-          ATLAS_IDX_ROOT=r2://$R2_BUCKET/idx
-          ATLAS_CHILDREN_ROOT=/mnt/drive/$R2_BUCKET/children
+          ATLAS_PEOPLE_ROOT=$ATLAS_MOUNT/people
+          ATLAS_CHILDREN_ROOT=$ATLAS_MOUNT/children
           ATLAS_SCRATCH=$ATLAS_HOME/scratch
           ATLAS_DUCK_MEMORY=10GB
           ATLAS_DUCK_THREADS=4
-          ATLAS_R2_ACCOUNT_ID=$R2_ACCOUNT
-          ATLAS_R2_ACCESS_KEY_ID=$R2_KEY
-          ATLAS_R2_SECRET_ACCESS_KEY=$R2_SECRET
-          ATLAS_R2_BUCKET=$R2_BUCKET
           ATLAS_PASSWORD_HASH=$PASSWORD_HASH
           ATLAS_TOKEN_SECRET=$TOKEN_SECRET
+          ATLAS_ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://bloomsrainbow09.github.io}
           EOF
           chmod 600 "$ATLAS_HOME/.env"
 
+          # One remote. The expiry is deliberately in the past: rclone then
+          # refreshes on first use and never trusts a stale access token that
+          # was baked into a secret months ago.
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
-          [atlas-r2]
-          type = s3
-          provider = Cloudflare
-          access_key_id = $R2_KEY
-          secret_access_key = $R2_SECRET
-          endpoint = https://$R2_ACCOUNT.r2.cloudflarestorage.com
-          acl = private
-          no_check_bucket = true
-
           [atlas-drive]
           type = drive
           scope = drive
@@ -183,44 +185,49 @@ jobs:
           root_folder_id = $GD_FOLDER
           EOF
           chmod 600 ~/.config/rclone/rclone.conf
-          echo "remotes: $(rclone listremotes | tr '\n' ' ')"
+          echo "remotes:"
+          rclone listremotes | sed 's/^/  /'
+          # Prove the credential works now, while the error is still readable.
+          rclone about atlas-drive: | sed 's/^/  /'
 
       # ------------------------------------------------------------------ #
-      - name: Warm the local tier
+      - name: Warm the hot tiers onto local disk
         # agg/ is 865 KB and answers every facet question; dims/ is 6.2 GiB and
-        # powers every typeahead keystroke. Both must be local: paying 100-300
-        # ms of network for a number that is already summed is the same mistake
-        # as scanning 107 million rows to count them, which is the whole reason
+        # powers every typeahead keystroke; idx/ is 11.8 GiB and backs every
+        # skill and school filter. All three must be local: paying 100-300 ms
+        # of network for a number that is already summed is the same mistake as
+        # scanning 107 million rows to count them, which is the whole reason
         # this lake has an agg/ at all.
         #
-        # ~6.2 GiB at the runner's bandwidth is two to four minutes, once per
-        # six-hour cycle.
+        # 18.0 GiB on a runner with ~59 GB usable, once per cycle. Ordered
+        # smallest first so a slow pull still leaves facets and typeahead
+        # working while idx/ is still arriving.
         run: |
           set -euo pipefail
           . "$ATLAS_HOME/.env"
           t0=$SECONDS
-          for tier in agg _manifest dims; do
+          for tier in agg _manifest dims idx; do
             echo "::group::pulling $tier"
-            rclone copy "atlas-r2:$ATLAS_R2_BUCKET/$tier" \
-                        "$ATLAS_HOME/lake/$tier" \
-              --checksum --transfers 16 --checkers 32 \
-              --stats 30s --stats-one-line -v
+            rclone copy "atlas-drive:$tier" "$ATLAS_HOME/lake/$tier"               --checksum --transfers 16 --checkers 32               --drive-chunk-size 64M --stats 30s -v
             echo "::endgroup::"
           done
-          echo "local tier warmed in $((SECONDS - t0))s"
+          echo "hot tiers warmed in $((SECONDS - t0))s"
           du -sh "$ATLAS_HOME/lake"/* | sed 's/^/  /'
 
-      - name: Mount the children tier
+      - name: Mount the cold tiers
+        # people/ (39.9 GiB) and children/ (58.5 GiB) are too big to copy and
+        # are read a few row groups at a time, so they come off a VFS-cached
+        # mount instead. children/ is in NON_FATAL_TIERS: a stalled mount costs
+        # the detail page and nothing else.
         run: |
           set -euo pipefail
           . "$ATLAS_HOME/.env"
-          sudo mkdir -p "/mnt/drive/$ATLAS_R2_BUCKET"
-          sudo chown -R "$USER" /mnt/drive
+          sudo mkdir -p "$ATLAS_MOUNT"
+          sudo chown -R "$USER" "$(dirname "$ATLAS_MOUNT")"
           # fuse needs this for --allow-other.
           sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-          app/deploy/runner/mount-drive.sh "/mnt/drive/$ATLAS_R2_BUCKET"
+          app/deploy/runner/mount-drive.sh "$ATLAS_MOUNT"
 
-      # ------------------------------------------------------------------ #
       - name: Start the backend
         working-directory: app
         run: |
@@ -315,24 +322,16 @@ jobs:
         run: |
           set -uo pipefail
           started=$SECONDS
-          dispatched=0
           echo "serving for $SERVE_SECONDS seconds"
 
           while (( SECONDS - started < SERVE_SECONDS )); do
             up=$(( SECONDS - started ))
 
-            # The successor goes out ten minutes before this run exits, so the
-            # relay has somewhere to move to before this one stops answering.
-            if (( dispatched == 0 && up >= DISPATCH_AFTER_SECONDS )); then
-              echo "handing over at ${up}s"
-              curl -fsS -X POST \
-                -H "Accept: application/vnd.github+json" \
-                -H "Authorization: Bearer ${{ secrets.ATLAS_DISPATCH_PAT }}" \
-                "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-                -d '{"event_type":"atlas-restart","client_payload":{"reason":"handover"}}' \
-                && { dispatched=1; echo "successor dispatched"; } \
-                || echo "::warning::handover dispatch failed; cron will cover it"
-            fi
+            # No handover dispatch. The cron above fires every four hours while
+            # this serves for 5 h 40 m, so the successor is already running and
+            # on the mesh before this run exits, and atlas-update-relay on the
+            # EC2 moves the relay to the newer of the two within two minutes.
+            # Nothing in this loop needs a GitHub token.
 
             # A backend that has died must not keep the slot: exiting lets the
             # EC2 watchdog start a replacement within five minutes instead of
@@ -358,38 +357,13 @@ jobs:
           echo "served $(( (SECONDS - started) / 60 )) minutes"
 
       # ------------------------------------------------------------------ #
-      - name: Launch the successor if this run actually served
-        if: always()
-        env:
-          UPTIME: ${{ steps.serve.outputs.uptime }}
-        run: |
-          set -uo pipefail
-          up=${UPTIME:-0}
-          if (( up < MIN_UPTIME_TO_REDISPATCH )); then
-            # The brake. A run that dies in its first minute must not
-            # re-dispatch, or a broken state becomes a tight dispatch loop
-            # bounded only by GitHub's abuse detection. Cron and the EC2
-            # watchdog will retry on a sane interval instead.
-            echo "::warning::served only ${up}s (< $MIN_UPTIME_TO_REDISPATCH);"\
-                 "not re-dispatching. Cron retries within the hour."
-            exit 0
-          fi
-          # The handover dispatch during `serve` is the normal path; this is the
-          # belt to its braces, for a run that exited without reaching it.
-          curl -fsS -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.ATLAS_DISPATCH_PAT }}" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-            -d '{"event_type":"atlas-restart","client_payload":{"reason":"exit"}}' \
-            || echo "::warning::re-dispatch failed; cron will cover it"
-
       - name: Stop cleanly
         if: always()
         run: |
           set +e
           [[ -f "$ATLAS_HOME/uvicorn.pid" ]] && kill "$(cat "$ATLAS_HOME/uvicorn.pid")"
           . "$ATLAS_HOME/.env" 2>/dev/null
-          app/deploy/runner/mount-drive.sh "/mnt/drive/${ATLAS_R2_BUCKET:-atlas-lake}" --unmount
+          app/deploy/runner/mount-drive.sh "$ATLAS_MOUNT" --unmount
           sudo tailscale logout 2>/dev/null
           tail -30 "$ATLAS_HOME/logs/uvicorn.log" 2>/dev/null
           exit 0
