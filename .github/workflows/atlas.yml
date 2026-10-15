@@ -241,16 +241,44 @@ jobs:
         # smallest first so a slow pull still leaves facets and typeahead
         # working while idx/ is still arriving.
         run: |
-          set -euo pipefail
+          set -uo pipefail
           . "$ATLAS_HOME/.env"
           t0=$SECONDS
+          got=""
+          missing=""
           for tier in agg _manifest dims idx; do
             echo "::group::pulling $tier"
-            rclone copy "atlas-drive:$tier" "$ATLAS_HOME/lake/$tier"               --checksum --transfers 16 --checkers 32               --drive-chunk-size 64M --stats 30s -v
+            if rclone copy "atlas-drive:$tier" "$ATLAS_HOME/lake/$tier" \
+                 --checksum --transfers 16 --checkers 32 \
+                 --drive-chunk-size 64M --stats 30s -v; then
+              got="$got $tier"
+            else
+              # Not fatal. A tier that is absent from Drive -- because the
+              # first upload has not reached it yet, or because it was never
+              # shipped -- costs that tier's endpoints and nothing else: the
+              # backend answers 503 naming it, and the UI says which part is
+              # missing. Aborting here would instead cost the whole service.
+              echo "::warning::$tier is not on Drive yet; the endpoints that"\
+                   "need it will answer 503 until it is"
+              missing="$missing $tier"
+            fi
             echo "::endgroup::"
           done
-          echo "hot tiers warmed in $((SECONDS - t0))s"
-          du -sh "$ATLAS_HOME/lake"/* | sed 's/^/  /'
+
+          echo "warmed in $((SECONDS - t0))s"
+          echo "  present:$got"
+          [ -n "$missing" ] && echo "  missing:$missing"
+          du -sh "$ATLAS_HOME/lake"/* 2>/dev/null | sed 's/^/  /' || true
+
+          # The one genuinely fatal case: nothing at all arrived. agg is 865 KB
+          # and is uploaded first, so if even that is absent the root is wrong,
+          # not merely incomplete -- and every later step would fail in a less
+          # obvious way.
+          if [ -z "$got" ]; then
+            echo "::error::no tier could be read from atlas-drive: --"\
+                 "check ATLAS_DRIVE_FOLDER_ID"
+            exit 1
+          fi
 
       - name: Mount the cold tiers
         # people/ (39.9 GiB) and children/ (58.5 GiB) are too big to copy and
