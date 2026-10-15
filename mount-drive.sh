@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Mount the `children` tier from Google Drive, tuned for Parquet range reads.
+# Mount the cold tiers from Google Drive, tuned for Parquet range reads.
 #
-# `children/` is 58.5 GiB in 75 files and serves exactly one endpoint:
+# `people/` (39.9 GiB, 1,564 files) and `children/` (58.5 GiB, 75 files) are
+# read from here. The hot tiers -- agg, dims, idx -- are copied to the
+# runner's own disk instead and never touch this mount.
+#
+# `children/` is the hard case and the flags below are chosen for it:
 # /api/person/{id}. A detail view reads twenty small slices out of files that
 # average 800 MB, so what matters is the cost of a *seek*, not throughput --
 # which is why this is a FUSE mount with a read cache rather than a download.
@@ -12,15 +16,20 @@
 # the only part of this deployment that costs money.
 #
 #   deploy/runner/mount-drive.sh /mnt/drive/atlas-lake
-#   deploy/runner/mount-drive.sh /mnt/drive/atlas-lake --unmount
+#   deploy/runner/mount-drive.sh /mnt/atlas-drive --unmount
 #
 # Reads credentials from rclone's own config or RCLONE_CONFIG_* environment
 # variables. Nothing here holds a secret.
 set -euo pipefail
 
-MOUNT_POINT="${1:-/mnt/drive/atlas-lake}"
+MOUNT_POINT="${1:-/mnt/atlas-drive}"
 REMOTE="${ATLAS_DRIVE_REMOTE:-atlas-drive}"
-BUCKET="${ATLAS_DRIVE_PATH:-atlas-lake}"
+# Empty by default, and that is the point: the `atlas-drive` remote is
+# configured with root_folder_id pointing at the atlas-lake folder, so the
+# remote root already *is* the lake. A default of "atlas-lake" here would
+# mount atlas-lake/atlas-lake, which exists nowhere and mounts as empty --
+# a lake that reads as "no files" rather than as an error.
+BUCKET="${ATLAS_DRIVE_PATH:-}"
 CACHE_DIR="${ATLAS_VFS_CACHE:-/opt/atlas/vfs-cache}"
 LOG="${ATLAS_MOUNT_LOG:-/opt/atlas/logs/mount-drive.log}"
 
@@ -41,7 +50,7 @@ mkdir -p "$MOUNT_POINT" "$CACHE_DIR" "$(dirname "$LOG")"
 # Already mounted and answering? Leave it alone. The runner's boot script is
 # idempotent on purpose: a watchdog that remounts a working mount is a watchdog
 # that drops in-flight reads.
-if mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT/children" ]]; then
+if mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT/children" && -d "$MOUNT_POINT/people" ]]; then
   echo "already mounted: $MOUNT_POINT"
   exit 0
 fi
@@ -103,7 +112,7 @@ rclone mount "${REMOTE}:${BUCKET}" "$MOUNT_POINT" \
 # letting the first request fail. Twenty seconds is generous; a healthy mount
 # is ready in two.
 for _ in $(seq 1 40); do
-  if mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT/children" ]]; then
+  if mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT/children" && -d "$MOUNT_POINT/people" ]]; then
     n=$(ls -1 "$MOUNT_POINT/children" 2>/dev/null | wc -l)
     echo "mounted $MOUNT_POINT  ($n child datasets visible)"
     exit 0
