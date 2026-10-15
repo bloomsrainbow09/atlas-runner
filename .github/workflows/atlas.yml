@@ -155,39 +155,70 @@ jobs:
           fi
 
           umask 077
+          # Every value is single-quoted, and that is not a style choice. The
+          # scrypt hash uses $ as its field separator -- scrypt$32768$8$1$...
+          # -- so an unquoted value is re-expanded when a later step sources
+          # this file, and a 114-character hash arrives as 41 characters of
+          # nonsense. The symptom is a password that is simply never accepted.
           cat > "$ATLAS_HOME/.env" <<EOF
-          ATLAS_AGG_ROOT=$ATLAS_HOME/lake/agg
-          ATLAS_DIMS_ROOT=$ATLAS_HOME/lake/dims
-          ATLAS_IDX_ROOT=$ATLAS_HOME/lake/idx
-          ATLAS_MANIFEST_ROOT=$ATLAS_HOME/lake/_manifest
-          ATLAS_PEOPLE_ROOT=$ATLAS_MOUNT/people
-          ATLAS_CHILDREN_ROOT=$ATLAS_MOUNT/children
-          ATLAS_SCRATCH=$ATLAS_HOME/scratch
-          ATLAS_DUCK_MEMORY=10GB
-          ATLAS_DUCK_THREADS=4
-          ATLAS_PASSWORD_HASH=$PASSWORD_HASH
-          ATLAS_TOKEN_SECRET=$TOKEN_SECRET
-          ATLAS_ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-https://bloomsrainbow09.github.io}
+          ATLAS_AGG_ROOT='$ATLAS_HOME/lake/agg'
+          ATLAS_DIMS_ROOT='$ATLAS_HOME/lake/dims'
+          ATLAS_IDX_ROOT='$ATLAS_HOME/lake/idx'
+          ATLAS_MANIFEST_ROOT='$ATLAS_HOME/lake/_manifest'
+          ATLAS_PEOPLE_ROOT='$ATLAS_MOUNT/people'
+          ATLAS_CHILDREN_ROOT='$ATLAS_MOUNT/children'
+          ATLAS_SCRATCH='$ATLAS_HOME/scratch'
+          ATLAS_DUCK_MEMORY='10GB'
+          ATLAS_DUCK_THREADS='4'
+          ATLAS_PASSWORD_HASH='$PASSWORD_HASH'
+          ATLAS_TOKEN_SECRET='$TOKEN_SECRET'
+          ATLAS_ALLOWED_ORIGINS='${ALLOWED_ORIGINS:-https://bloomsrainbow09.github.io}'
           EOF
           chmod 600 "$ATLAS_HOME/.env"
 
-          # One remote. The expiry is deliberately in the past: rclone then
-          # refreshes on first use and never trusts a stale access token that
-          # was baked into a secret months ago.
+          # Prove the hash survived the round trip, rather than discovering it
+          # at the login screen.
+          ( set -a; . "$ATLAS_HOME/.env"; set +a
+            n=$(printf '%s' "$ATLAS_PASSWORD_HASH" | tr -cd '$' | wc -c)
+            echo "password hash: ${#ATLAS_PASSWORD_HASH} chars, $n separators"
+            if [ "$n" != "5" ]; then
+              echo "::error::the password hash lost fields to shell expansion"
+              exit 1
+            fi )
+
+          # rclone's config is built line by line with printf. A heredoc here
+          # is what broke the previous attempt: indented, it leaves leading
+          # whitespace in every value. printf also keeps the secrets off the
+          # command line, so they never appear in a process listing.
           mkdir -p ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
-          [atlas-drive]
-          type = drive
-          scope = drive
-          client_id = $GD_CLIENT_ID
-          client_secret = $GD_CLIENT_SECRET
-          token = {"refresh_token":"$GD_TOKEN","token_type":"Bearer","expiry":"2000-01-01T00:00:00Z"}
-          root_folder_id = $GD_FOLDER
-          EOF
-          chmod 600 ~/.config/rclone/rclone.conf
+          CONF=~/.config/rclone/rclone.conf
+          {
+            echo "[atlas-drive]"
+            echo "type = drive"
+            echo "scope = drive"
+            printf 'client_id = %s\n' "$GD_CLIENT_ID"
+            printf 'client_secret = %s\n' "$GD_CLIENT_SECRET"
+            printf 'root_folder_id = %s\n' "$GD_FOLDER"
+            # The expiry is deliberately in the past, so rclone refreshes on
+            # first use instead of trusting an access token that was baked
+            # into a repository secret at some unknown time.
+            printf 'token = {"access_token":"","token_type":"Bearer","refresh_token":"%s","expiry":"2000-01-01T00:00:00Z"}\n' "$GD_TOKEN"
+          } > "$CONF"
+          chmod 600 "$CONF"
+
           echo "remotes:"
           rclone listremotes | sed 's/^/  /'
-          # Prove the credential works now, while the error is still readable.
+
+          # Assert the refresh token is actually in the file, here, where the
+          # message is readable -- not in the warm step as a copy that finds
+          # nothing.
+          if ! grep -q 'refresh_token":"[^"]' "$CONF"; then
+            echo "::error::the rclone config has no refresh token"
+            exit 1
+          fi
+          echo "  refresh token present (${#GD_TOKEN} chars)"
+
+          # And prove the credential works against Google before going on.
           rclone about atlas-drive: | sed 's/^/  /'
 
       # ------------------------------------------------------------------ #
