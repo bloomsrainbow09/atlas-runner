@@ -199,10 +199,17 @@ jobs:
             printf 'client_id = %s\n' "$GD_CLIENT_ID"
             printf 'client_secret = %s\n' "$GD_CLIENT_SECRET"
             printf 'root_folder_id = %s\n' "$GD_FOLDER"
+            # access_token is a non-empty placeholder on purpose. With an
+            # empty string -- or with the key absent -- oauth2 treats the
+            # whole token as unset and never constructs the refresher, and
+            # rclone reports "token expired and there is no refresh token"
+            # even though the refresh token is right there in the file.
+            # Verified three ways on the workstation: "" fails, absent
+            # fails, any non-empty value works.
             # The expiry is deliberately in the past, so rclone refreshes on
             # first use instead of trusting an access token that was baked
             # into a repository secret at some unknown time.
-            printf 'token = {"access_token":"","token_type":"Bearer","refresh_token":"%s","expiry":"2000-01-01T00:00:00Z"}\n' "$GD_TOKEN"
+            printf 'token = {"access_token":"expired","token_type":"Bearer","refresh_token":"%s","expiry":"2000-01-01T00:00:00Z"}\n' "$GD_TOKEN"
           } > "$CONF"
           chmod 600 "$CONF"
 
