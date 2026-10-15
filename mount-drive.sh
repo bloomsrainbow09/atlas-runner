@@ -50,7 +50,7 @@ mkdir -p "$MOUNT_POINT" "$CACHE_DIR" "$(dirname "$LOG")"
 # Already mounted and answering? Leave it alone. The runner's boot script is
 # idempotent on purpose: a watchdog that remounts a working mount is a watchdog
 # that drops in-flight reads.
-if mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT/children" && -d "$MOUNT_POINT/people" ]]; then
+if mountpoint -q "$MOUNT_POINT" && ls "$MOUNT_POINT" >/dev/null 2>&1; then
   echo "already mounted: $MOUNT_POINT"
   exit 0
 fi
@@ -112,9 +112,19 @@ rclone mount "${REMOTE}:${BUCKET}" "$MOUNT_POINT" \
 # letting the first request fail. Twenty seconds is generous; a healthy mount
 # is ready in two.
 for _ in $(seq 1 40); do
-  if mountpoint -q "$MOUNT_POINT" && [[ -d "$MOUNT_POINT/children" && -d "$MOUNT_POINT/people" ]]; then
-    n=$(ls -1 "$MOUNT_POINT/children" 2>/dev/null | wc -l)
-    echo "mounted $MOUNT_POINT  ($n child datasets visible)"
+  if mountpoint -q "$MOUNT_POINT" && ls "$MOUNT_POINT" >/dev/null 2>&1; then
+    # Readiness is "the mount answers", not "a particular tier is
+    # inside it". Waiting for children/ meant a lake still being
+    # uploaded could never be mounted at all, and the backend
+    # already reports a missing tier as a 503 that names it.
+    for t in people children; do
+      if [[ -d "$MOUNT_POINT/$t" ]]; then
+        echo "  $t: $(ls -1 "$MOUNT_POINT/$t" 2>/dev/null | wc -l) files"
+      else
+        echo "  $t: not on Drive yet"
+      fi
+    done
+    echo "mounted $MOUNT_POINT"
     exit 0
   fi
   sleep 0.5
