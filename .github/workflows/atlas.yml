@@ -50,12 +50,23 @@ on:
   schedule:
     - cron: '17 */4 * * *'
 
-# One runner at a time, and never cancel the one that is serving traffic.
-# `cancel-in-progress: true` here would mean every cron tick killed a healthy
-# backend mid-request.
-concurrency:
-  group: atlas-backend
-  cancel-in-progress: false
+# Deliberately no `concurrency` group.
+#
+# Runs must be allowed to overlap: cron fires every four hours, a run serves for
+# 5 h 40 m, and the overlap is what makes the handover seamless. The new backend
+# warms its 18 GiB, joins the mesh, and only then does atlas-update-relay move
+# the relay onto it -- while the old one is still answering.
+#
+# A group here (`cancel-in-progress: false`) queues the new run instead, so it
+# starts only after its predecessor exits and the gap becomes the whole startup
+# time, about eight minutes of 502s every four hours. That is what this file did
+# until it was watched doing it.
+#
+# `cancel-in-progress: true` would be worse again: every cron tick would kill a
+# healthy backend mid-request.
+#
+# Nothing can run away: cron is fixed, and the only other trigger is a manual
+# dispatch.
 
 permissions:
   contents: read
