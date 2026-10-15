@@ -292,7 +292,11 @@ jobs:
           sudo chown -R "$USER" "$(dirname "$ATLAS_MOUNT")"
           # fuse needs this for --allow-other.
           sudo sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-          app/deploy/runner/mount-drive.sh "$ATLAS_MOUNT"
+          # Invoked through bash rather than executed. The executable bit
+          # survives neither a Windows checkout nor the contents API that
+          # publishes this workflow, and the failure is a bare
+          # "Permission denied" with exit 126.
+          bash app/deploy/runner/mount-drive.sh "$ATLAS_MOUNT"
 
       - name: Start the backend
         working-directory: app
@@ -429,7 +433,7 @@ jobs:
           set +e
           [[ -f "$ATLAS_HOME/uvicorn.pid" ]] && kill "$(cat "$ATLAS_HOME/uvicorn.pid")"
           . "$ATLAS_HOME/.env" 2>/dev/null
-          app/deploy/runner/mount-drive.sh "$ATLAS_MOUNT" --unmount
+          bash app/deploy/runner/mount-drive.sh "$ATLAS_MOUNT" --unmount
           sudo tailscale logout 2>/dev/null
           tail -30 "$ATLAS_HOME/logs/uvicorn.log" 2>/dev/null
           exit 0
