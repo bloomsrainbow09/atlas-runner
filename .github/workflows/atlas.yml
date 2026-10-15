@@ -310,22 +310,41 @@ jobs:
             > "$ATLAS_HOME/logs/uvicorn.log" 2>&1 &
           echo $! > "$ATLAS_HOME/uvicorn.pid"
 
-          # Wait for a health response that proves the lake is actually
-          # readable, not merely that a port is open. A backend answering 200
-          # with an unreachable tier would pass a port check and fail every
-          # query.
+          # Wait for the app to answer at all. That is the fatal condition:
+          # no response means uvicorn died, and the log says why.
+          body=""
           for i in $(seq 1 90); do
             body=$(curl -fsS "http://127.0.0.1:$ATLAS_PORT/api/health" 2>/dev/null || true)
-            if [[ -n "$body" ]] && [[ "$(jq -r '.ok' <<<"$body")" == "true" ]]; then
-              jq '{ok, detail, people_rows, auth, tiers}' <<<"$body"
-              echo "ready after ${i}s"
-              exit 0
+            if [[ -n "$body" ]]; then
+              echo "answered after ${i}s"
+              break
             fi
             sleep 1
           done
-          echo "::error::the backend did not become healthy in 90s"
-          tail -60 "$ATLAS_HOME/logs/uvicorn.log"
-          exit 1
+
+          if [[ -z "$body" ]]; then
+            echo "::error::the backend never answered /api/health in 90s"
+            tail -60 "$ATLAS_HOME/logs/uvicorn.log"
+            exit 1
+          fi
+
+          jq '{ok, detail, people_rows, auth, tiers}' <<<"$body"
+
+          # A lake that is not fully readable is reported, not fatal. Every
+          # endpoint whose tier is present still works, and the rest answer 503
+          # naming the tier -- which is strictly better than answering nothing.
+          if [[ "$(jq -r '.ok' <<<"$body")" != "true" ]]; then
+            echo "::warning::serving degraded: $(jq -r '.detail // "some tier is unreadable"' <<<"$body")"
+          fi
+
+          # The gate, though, is not negotiable. An ungated backend on a public
+          # address exposes 400 million personal records, so a missing password
+          # is fatal here even though the app would happily run without one.
+          if [[ "$(jq -r '.auth' <<<"$body")" != "true" ]]; then
+            echo "::error::the password gate is OFF -- refusing to serve"
+            exit 1
+          fi
+          echo "password gate: on"
 
       - name: Confirm the gate is on
         # A deployed instance that is quietly open looks exactly like one that
