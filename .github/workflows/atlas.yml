@@ -371,39 +371,60 @@ jobs:
           TS_AUTHKEY: ${{ secrets.ATLAS_TAILSCALE_AUTHKEY }}
           HS_URL: ${{ secrets.ATLAS_HEADSCALE_URL }}
           HS_CA: ${{ secrets.ATLAS_HEADSCALE_CA_CERT }}
+        # Deliberately a copy of the join in the Automation project's
+        # n8n-linux.yml, which has run against this same Headscale since May.
+        # Earlier attempts to improve on it -- a hand-started tailscaled in
+        # userspace-networking mode, and --advertise-tags -- produced a step
+        # that hung indefinitely with nothing registered on the control server.
         run: |
           set -euo pipefail
           if [[ -z "${TS_AUTHKEY:-}" || -z "${HS_URL:-}" ]]; then
-            echo "::warning::no mesh credentials; the backend is up but the "\
-                 "EC2 relay cannot reach it. Set ATLAS_TAILSCALE_AUTHKEY and "\
-                 "ATLAS_HEADSCALE_URL (docs/DEPLOYMENT.md section 9)."
+            echo "::warning::no mesh credentials; the backend is up but the"\
+                 "EC2 relay cannot reach it (docs/DEPLOYMENT.md section 9)."
             exit 0
           fi
-          curl -fsSL https://tailscale.com/install.sh | sudo bash
+
           # The control server uses a self-signed CA on purpose: both ends are
-          # ours, and Let's Encrypt would need a domain. The runner has to be
-          # told to trust it.
+          # ours, and a public certificate would need a domain. Trust it before
+          # tailscaled starts, or the first connection fails and it backs off.
           if [[ -n "${HS_CA:-}" ]]; then
             echo "$HS_CA" | sudo tee /usr/local/share/ca-certificates/headscale.crt >/dev/null
             sudo update-ca-certificates
           fi
-          sudo tailscaled --tun=userspace-networking \
-               --socks5-server=localhost:1055 \
-               --state=/var/lib/tailscale/tailscaled.state \
-               > "$ATLAS_HOME/logs/tailscaled.log" 2>&1 &
-          sleep 5
-          sudo tailscale up \
-            --login-server "$HS_URL" \
-            --authkey "$TS_AUTHKEY" \
-            --hostname atlas-runner \
-            --accept-dns=false \
-            --advertise-tags=tag:atlas || {
-              echo "::warning::could not join the mesh; serving locally only"
-              exit 0
-            }
-          ip=$(sudo tailscale ip -4 || true)
-          echo "mesh ip: ${ip:-unknown}"
-          echo "ATLAS_MESH_IP=${ip:-}" >> "$GITHUB_ENV"
+
+          # The installer starts tailscaled as a service. Do not start a second
+          # one by hand: `tailscale up` would then be talking to a different
+          # daemon than the one holding the flags.
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
+
+          # No --advertise-tags: this Headscale defines no ACL tags, and an
+          # unknown tag is rejected. The outer `timeout` is the real protection
+          # -- without it a control server that cannot be reached leaves this
+          # step running until the job's own 350-minute limit.
+          if ! sudo timeout 180 tailscale up \
+                 --login-server="$HS_URL" \
+                 --authkey="$TS_AUTHKEY" \
+                 --hostname=atlas-runner \
+                 --accept-dns=false; then
+            echo "::warning::could not join the mesh; the backend is up but"\
+                 "only reachable from inside this job"
+            sudo tailscale status 2>&1 | head -10 || true
+            tail -30 /var/log/syslog 2>/dev/null | grep -i tailscale | tail -10 || true
+            exit 0
+          fi
+
+          ip=""
+          for i in $(seq 1 30); do
+            ip=$(sudo tailscale ip -4 2>/dev/null || true)
+            [ -n "$ip" ] && break
+            sleep 3
+          done
+          if [ -z "$ip" ]; then
+            echo "::warning::joined but no mesh IP was assigned"
+            exit 0
+          fi
+          echo "mesh ip: $ip  (hostname atlas-runner)"
+          echo "ATLAS_MESH_IP=$ip" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------ #
       - name: Serve
