@@ -77,9 +77,10 @@ env:
   # tiers are copied to $ATLAS_HOME/lake instead.
   ATLAS_MOUNT: /mnt/atlas-drive
   ATLAS_PORT: '8787'
-  # 5 h 40 m. GitHub kills at 6 h; the successor is dispatched at 5 h 30 m, so
-  # there is a ten-minute overlap in which the relay can move across before
-  # this one exits.
+  # 5 h 40 m. GitHub kills at 6 h, and the cron above starts the next run every
+  # 4 h, so for the last 1 h 40 m of a run its successor is already up and the
+  # relay can move across before this one exits. Nothing is dispatched: see the
+  # note on the schedule.
   SERVE_SECONDS: '20400'
 
 jobs:
@@ -176,6 +177,7 @@ jobs:
           ATLAS_DIMS_ROOT='$ATLAS_HOME/lake/dims'
           ATLAS_IDX_ROOT='$ATLAS_HOME/lake/idx'
           ATLAS_MANIFEST_ROOT='$ATLAS_HOME/lake/_manifest'
+          ATLAS_TOP_ROOT='$ATLAS_HOME/lake/top'
           ATLAS_PEOPLE_ROOT='$ATLAS_MOUNT/people'
           ATLAS_CHILDREN_ROOT='$ATLAS_MOUNT/children'
           ATLAS_SCRATCH='$ATLAS_HOME/scratch'
@@ -248,16 +250,24 @@ jobs:
         # scanning 107 million rows to count them, which is the whole reason
         # this lake has an agg/ at all.
         #
-        # 18.0 GiB on a runner with ~59 GB usable, once per cycle. Ordered
-        # smallest first so a slow pull still leaves facets and typeahead
-        # working while idx/ is still arriving.
+        # top/ is 15.0 GiB and is the connection-ordered sidecar: every scoped
+        # search sorts by connections by default, and on people/ that sort is a
+        # scan of every matching row -- measured on the live site at 87,849 ms
+        # for one page of United States results against 1,227 ms for the same
+        # query unsorted. Reading it from the mount would give the scan back,
+        # so it goes on local disk with the rest.
+        #
+        # 33.0 GiB on a runner with ~59 GB usable, once per cycle, leaving room
+        # for the 8 GiB VFS cache the mount needs. Ordered smallest first so a
+        # slow pull still leaves facets and typeahead working while idx/ and
+        # top/ are still arriving.
         run: |
           set -uo pipefail
           . "$ATLAS_HOME/.env"
           t0=$SECONDS
           got=""
           missing=""
-          for tier in agg _manifest dims idx; do
+          for tier in agg _manifest dims idx top; do
             echo "::group::pulling $tier"
             if rclone copy "atlas-drive:$tier" "$ATLAS_HOME/lake/$tier" \
                  --checksum --transfers 16 --checkers 32 \
@@ -425,7 +435,10 @@ jobs:
           fi
 
           ip=""
-          for i in $(seq 1 30); do
+          # `_` rather than `i`: the counter is never read, and a named
+          # variable that is never used is a reader wondering what they
+          # missed.
+          for _ in $(seq 1 30); do
             ip=$(sudo tailscale ip -4 2>/dev/null || true)
             [ -n "$ip" ] && break
             sleep 3
